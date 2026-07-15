@@ -27,7 +27,7 @@ import (
 
 var (
 	listenAddr  = flag.String("listen", ":42420", "listen address")
-	refreshSec  = flag.Int("refresh", 30, "refresh interval")
+	refreshSec  = flag.Int("refresh", 3600, "refresh interval")
 	manualPeers = flag.String("manual-peers", "", "additional manual RPC peers (comma-separated)")
 )
 
