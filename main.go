@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -453,12 +454,13 @@ func (p *proxyServer) MessageStream(stream protowire.RPC_MessageStreamServer) er
 		return grpc.ErrServerStopped
 	}
 
+	// Extract client address for sticky routing
+	clientAddr := extractClientAddr(stream.Context())
+	log.Printf("New MessageStream from client %s", clientAddr)
+
 	// Create a timeout context for the entire request (5 minutes)
 	ctx, cancel := context.WithTimeout(stream.Context(), requestTimeout)
 	defer cancel()
-
-	// Extract client address for sticky routing
-	clientAddr := extractClientAddr(stream.Context())
 
 	// Get the sticky peer for this client
 	target := getPeerForClient(clientAddr)
@@ -504,10 +506,34 @@ func (p *proxyServer) MessageStream(stream protowire.RPC_MessageStreamServer) er
 	defer clearClientPeer(clientAddr)
 
 	errChan := make(chan error, 2)
-	go relayClientToUpstream(stream, upstreamStream, target, errChan)
-	go relayUpstreamToClient(upstreamStream, stream, errChan)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	return <-errChan
+	go func() {
+		defer wg.Done()
+		relayClientToUpstream(stream, upstreamStream, target, errChan)
+	}()
+	go func() {
+		defer wg.Done()
+		relayUpstreamToClient(upstreamStream, stream, errChan)
+	}()
+
+	select {
+	case err := <-errChan:
+		// Wait for both relay goroutines to finish
+		go func() { wg.Wait() }()
+		if err == context.DeadlineExceeded || err == context.Canceled {
+			log.Printf("Stream for client %s completed due to timeout/cancellation", clientAddr)
+		} else if err != nil && err != io.EOF {
+			log.Printf("Stream for client %s failed: %v", clientAddr, err)
+		}
+		return err
+	case <-ctx.Done():
+		// Wait for both relay goroutines to finish in background
+		go func() { wg.Wait() }()
+		log.Printf("Stream for client %s timed out after %v", clientAddr, requestTimeout)
+		return ctx.Err()
+	}
 }
 
 func main() {
