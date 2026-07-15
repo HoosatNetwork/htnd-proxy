@@ -19,8 +19,10 @@ import (
 	"github.com/Hoosat-Oy/HTND/infrastructure/network/netadapter/server/grpcserver"
 	"github.com/Hoosat-Oy/HTND/infrastructure/network/netadapter/server/grpcserver/protowire"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/peer"
 )
 
 var (
@@ -30,14 +32,16 @@ var (
 )
 
 var (
-	healthyPeers []string
-	peersMu      sync.RWMutex
-	nextPeer     uint64
+	healthyPeers   []string
+	peersMu        sync.RWMutex
+	nextPeer       uint64
+	clientPeerMap  sync.Map // maps clientAddr (string) -> assigned peer (string)
 )
 
 const (
 	peerProbeTimeout        = 10 * time.Second
 	upstreamDialTimeout     = 5 * time.Second
+	requestTimeout          = 5 * time.Minute
 	defaultLocalRPCPeerHost = "127.0.0.1"
 	defaultLocalRPCPeerPort = "42520"
 	maxConcurrentStreams    = ^uint32(0)
@@ -129,6 +133,65 @@ func getNextPeer() string {
 	}
 	index := atomic.AddUint64(&nextPeer, 1) - 1
 	return healthyPeers[index%uint64(len(healthyPeers))]
+}
+
+// extractClientAddr extracts the client's remote address from the gRPC context.
+// Returns the address as "host:port" or empty string if not available.
+func extractClientAddr(ctx context.Context) string {
+	p, ok := peer.FromContext(ctx)
+	if !ok || p.Addr == nil {
+		return ""
+	}
+	return p.Addr.String()
+}
+
+// getPeerForClient returns the assigned peer for a client, or assigns a new one.
+// It implements sticky routing: same client always gets the same peer.
+// If the assigned peer is no longer healthy, it picks a new one and updates the mapping.
+func getPeerForClient(clientAddr string) string {
+	// If no client address, fall back to round-robin
+	if clientAddr == "" {
+		return getNextPeer()
+	}
+
+	// Check if client already has an assigned peer
+	if assigned, ok := clientPeerMap.Load(clientAddr); ok {
+		if assignedPeer, ok := assigned.(string); ok {
+			// Verify the assigned peer is still healthy
+			peersMu.RLock()
+			isHealthy := false
+			for _, p := range healthyPeers {
+				if p == assignedPeer {
+					isHealthy = true
+					break
+				}
+			}
+			peersMu.RUnlock()
+			
+			if isHealthy {
+				log.Printf("Client %s reassigned to existing peer %s", clientAddr, assignedPeer)
+				return assignedPeer
+			}
+			// Assigned peer is unhealthy - will pick new one below
+			log.Printf("Client %s assigned peer %s is unhealthy, picking new peer", clientAddr, assignedPeer)
+		}
+	}
+
+	// No existing assignment or assigned peer is unhealthy - pick new peer
+	newPeer := getNextPeer()
+	if newPeer != "" {
+		clientPeerMap.Store(clientAddr, newPeer)
+		log.Printf("Client %s assigned to new peer %s", clientAddr, newPeer)
+	}
+	return newPeer
+}
+
+// clearClientPeer removes the client-to-peer mapping.
+func clearClientPeer(clientAddr string) {
+	if clientAddr != "" {
+		clientPeerMap.Delete(clientAddr)
+		log.Printf("Cleaned up mapping for client %s", clientAddr)
+	}
 }
 
 func deriveRPCAddress(peerAddress string) (string, bool) {
@@ -390,27 +453,55 @@ func (p *proxyServer) MessageStream(stream protowire.RPC_MessageStreamServer) er
 		return grpc.ErrServerStopped
 	}
 
-	start := atomic.AddUint64(&nextPeer, 1) - 1
+	// Create a timeout context for the entire request (5 minutes)
+	ctx, cancel := context.WithTimeout(stream.Context(), requestTimeout)
+	defer cancel()
+
+	// Extract client address for sticky routing
+	clientAddr := extractClientAddr(stream.Context())
+	
+	// Get the sticky peer for this client
+	target := getPeerForClient(clientAddr)
+	if target == "" {
+		return grpc.ErrServerStopped
+	}
+
+	// Verify the target is still in our healthy peers list (might have changed since getPeerForClient)
+	peersMu.RLock()
+	isHealthy := false
+	for _, p := range healthyPeers {
+		if p == target {
+			isHealthy = true
+			break
+		}
+	}
+	peersMu.RUnlock()
+	
+	if !isHealthy {
+		// Target became unhealthy, clear mapping and fail
+		clearClientPeer(clientAddr)
+		log.Printf("Client %s: assigned peer %s became unhealthy, failing stream", clientAddr, target)
+		return grpc.Errorf(codes.Unavailable, "assigned upstream peer %s is unhealthy", target)
+	}
+
 	var (
 		upstreamConn   *grpc.ClientConn
 		upstreamStream protowire.RPC_MessageStreamClient
-		target         string
 		err            error
 	)
 
-	for i := range peers {
-		target = peers[(int(start)+i)%len(peers)]
-		upstreamConn, upstreamStream, err = dialUpstream(stream.Context(), target)
-		if err == nil {
-			break
-		}
-		log.Printf("Upstream %s unavailable: %v", target, err)
-	}
+	upstreamConn, upstreamStream, err = dialUpstream(ctx, target)
 	if err != nil {
+		// Dial failed - clear mapping so client gets new peer on reconnect
+		clearClientPeer(clientAddr)
+		log.Printf("Client %s: failed to dial assigned peer %s: %v, clearing mapping", clientAddr, target, err)
 		return err
 	}
 	defer upstreamConn.Close()
 	defer upstreamStream.CloseSend()
+
+	// Clean up client mapping when stream ends
+	defer clearClientPeer(clientAddr)
 
 	errChan := make(chan error, 2)
 	go relayClientToUpstream(stream, upstreamStream, target, errChan)
