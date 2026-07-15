@@ -502,9 +502,6 @@ func (p *proxyServer) MessageStream(stream protowire.RPC_MessageStreamServer) er
 	defer upstreamConn.Close()
 	defer upstreamStream.CloseSend()
 
-	// Clean up client mapping when stream ends
-	defer clearClientPeer(clientAddr)
-
 	errChan := make(chan error, 2)
 	var wg sync.WaitGroup
 	wg.Add(2)
