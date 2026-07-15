@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -33,10 +34,11 @@ var (
 )
 
 var (
-	healthyPeers  []string
-	peersMu       sync.RWMutex
-	nextPeer      uint64
-	clientPeerMap sync.Map // maps clientAddr (string) -> assigned peer (string)
+	healthyPeers   []string
+	peersMu        sync.RWMutex
+	nextPeer       uint64
+	clientPeerMap  sync.Map // maps clientAddr (string) -> assigned peer (string)
+	peerConnections sync.Map // maps peer address -> *grpc.ClientConn
 )
 
 const (
@@ -121,8 +123,25 @@ func fetchPeers() {
 
 func updateHealthyPeers(good []string) {
 	peersMu.Lock()
+	oldPeers := healthyPeers
 	healthyPeers = good
 	peersMu.Unlock()
+	
+	// Close connections for peers that are no longer healthy
+	for _, peer := range oldPeers {
+		isStillHealthy := false
+		for _, healthyPeer := range good {
+			if peer == healthyPeer {
+				isStillHealthy = true
+				break
+			}
+		}
+		if !isStillHealthy {
+			closePeerConnection(peer)
+			log.Printf("Closed connection to unhealthy peer: %s", peer)
+		}
+	}
+	
 	log.Printf("Loaded %d RPC peers", len(good))
 }
 
@@ -134,6 +153,63 @@ func getNextPeer() string {
 	}
 	index := atomic.AddUint64(&nextPeer, 1) - 1
 	return healthyPeers[index%uint64(len(healthyPeers))]
+}
+
+// getPeerConnection returns a cached gRPC connection for the given peer address.
+// If no cached connection exists or it's not healthy, creates a new one.
+func getPeerConnection(ctx context.Context, peerAddr string) (*grpc.ClientConn, error) {
+	// Try to get existing connection
+	if conn, ok := peerConnections.Load(peerAddr); ok {
+		if gconn, ok := conn.(*grpc.ClientConn); ok {
+			// Check if connection is still healthy
+			state := gconn.GetState()
+			if state == connectivity.Ready || state == connectivity.Idle {
+				return gconn, nil
+			}
+			// Connection is in bad state, remove it
+			peerConnections.Delete(peerAddr)
+			_ = gconn.Close()
+		}
+	}
+
+	// Create new connection
+	conn, err := grpc.NewClient(peerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create connection to %s: %v", peerAddr, err)
+	}
+
+	// Wait for connection to be ready
+	readyCtx, cancel := context.WithTimeout(ctx, upstreamDialTimeout)
+	defer cancel()
+	if err := waitForConnectionReady(readyCtx, conn); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("connection to %s not ready: %v", peerAddr, err)
+	}
+
+	// Store in cache
+	peerConnections.Store(peerAddr, conn)
+	
+	return conn, nil
+}
+
+// closePeerConnection closes and removes the cached connection for a peer.
+func closePeerConnection(peerAddr string) {
+	if conn, ok := peerConnections.LoadAndDelete(peerAddr); ok {
+		if gconn, ok := conn.(*grpc.ClientConn); ok {
+			_ = gconn.Close()
+		}
+	}
+}
+
+// closeAllPeerConnections closes all cached connections.
+func closeAllPeerConnections() {
+	peerConnections.Range(func(key, value interface{}) bool {
+		if gconn, ok := value.(*grpc.ClientConn); ok {
+			_ = gconn.Close()
+		}
+		peerConnections.Delete(key)
+		return true
+	})
 }
 
 // extractClientAddr extracts the client's remote address from the gRPC context.
@@ -354,15 +430,9 @@ func snapshotPeers() []string {
 }
 
 func dialUpstream(ctx context.Context, target string) (*grpc.ClientConn, protowire.RPC_MessageStreamClient, error) {
-	connection, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Get or create connection from pool
+	connection, err := getPeerConnection(ctx, target)
 	if err != nil {
-		return nil, nil, err
-	}
-
-	readyCtx, cancel := context.WithTimeout(ctx, upstreamDialTimeout)
-	defer cancel()
-	if err := waitForConnectionReady(readyCtx, connection); err != nil {
-		_ = connection.Close()
 		return nil, nil, err
 	}
 
@@ -372,7 +442,7 @@ func dialUpstream(ctx context.Context, target string) (*grpc.ClientConn, protowi
 		grpc.MaxCallSendMsgSize(grpcserver.RPCMaxMessageSize),
 	)
 	if err != nil {
-		_ = connection.Close()
+		// Don't close the connection here - it's shared and might be reused
 		return nil, nil, err
 	}
 
@@ -480,26 +550,26 @@ func (p *proxyServer) MessageStream(stream protowire.RPC_MessageStreamServer) er
 	peersMu.RUnlock()
 
 	if !isHealthy {
-		// Target became unhealthy, clear mapping and fail
+		// Target became unhealthy, clear mapping and close connection, then fail
 		clearClientPeer(clientAddr)
+		closePeerConnection(target)
 		log.Printf("Client %s: assigned peer %s became unhealthy, failing stream", clientAddr, target)
 		return grpc.Errorf(codes.Unavailable, "assigned upstream peer %s is unhealthy", target)
 	}
 
 	var (
-		upstreamConn   *grpc.ClientConn
 		upstreamStream protowire.RPC_MessageStreamClient
 		err            error
 	)
 
-	upstreamConn, upstreamStream, err = dialUpstream(ctx, target)
+	_, upstreamStream, err = dialUpstream(ctx, target)
 	if err != nil {
 		// Dial failed - clear mapping so client gets new peer on reconnect
 		clearClientPeer(clientAddr)
 		log.Printf("Client %s: failed to dial assigned peer %s: %v, clearing mapping", clientAddr, target, err)
 		return err
 	}
-	defer upstreamConn.Close()
+	// Note: We don't close upstreamConn here as it's shared via connection pool
 	defer upstreamStream.CloseSend()
 
 	errChan := make(chan error, 2)
