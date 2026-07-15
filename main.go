@@ -39,7 +39,7 @@ var (
 )
 
 const (
-	peerProbeTimeout        = 10 * time.Minute
+	peerProbeTimeout        = 10 * time.Second
 	upstreamDialTimeout     = 5 * time.Second
 	requestTimeout          = 5 * time.Minute
 	defaultLocalRPCPeerHost = "127.0.0.1"
