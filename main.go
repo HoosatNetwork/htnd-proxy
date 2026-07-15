@@ -28,7 +28,7 @@ import (
 
 var (
 	listenAddr  = flag.String("listen", ":42420", "listen address")
-	refreshSec  = flag.Int("refresh", 3600, "refresh interval")
+	refreshSec  = flag.Int("refresh", 30, "refresh interval")
 	manualPeers = flag.String("manual-peers", "", "additional manual RPC peers (comma-separated)")
 )
 
@@ -42,7 +42,7 @@ var (
 const (
 	peerProbeTimeout        = 10 * time.Second
 	upstreamDialTimeout     = 5 * time.Second
-	requestTimeout          = 5 * time.Minute
+	requestTimeout          = 30 * time.Second
 	defaultLocalRPCPeerHost = "127.0.0.1"
 	defaultLocalRPCPeerPort = "42520"
 	maxConcurrentStreams    = ^uint32(0)
