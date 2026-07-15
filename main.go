@@ -32,14 +32,14 @@ var (
 )
 
 var (
-	healthyPeers   []string
-	peersMu        sync.RWMutex
-	nextPeer       uint64
-	clientPeerMap  sync.Map // maps clientAddr (string) -> assigned peer (string)
+	healthyPeers  []string
+	peersMu       sync.RWMutex
+	nextPeer      uint64
+	clientPeerMap sync.Map // maps clientAddr (string) -> assigned peer (string)
 )
 
 const (
-	peerProbeTimeout        = 10 * time.Second
+	peerProbeTimeout        = 10 * time.Minute
 	upstreamDialTimeout     = 5 * time.Second
 	requestTimeout          = 5 * time.Minute
 	defaultLocalRPCPeerHost = "127.0.0.1"
@@ -167,7 +167,7 @@ func getPeerForClient(clientAddr string) string {
 				}
 			}
 			peersMu.RUnlock()
-			
+
 			if isHealthy {
 				log.Printf("Client %s reassigned to existing peer %s", clientAddr, assignedPeer)
 				return assignedPeer
@@ -459,7 +459,7 @@ func (p *proxyServer) MessageStream(stream protowire.RPC_MessageStreamServer) er
 
 	// Extract client address for sticky routing
 	clientAddr := extractClientAddr(stream.Context())
-	
+
 	// Get the sticky peer for this client
 	target := getPeerForClient(clientAddr)
 	if target == "" {
@@ -476,7 +476,7 @@ func (p *proxyServer) MessageStream(stream protowire.RPC_MessageStreamServer) er
 		}
 	}
 	peersMu.RUnlock()
-	
+
 	if !isHealthy {
 		// Target became unhealthy, clear mapping and fail
 		clearClientPeer(clientAddr)
