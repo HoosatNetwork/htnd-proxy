@@ -455,6 +455,10 @@ func probeRPCAddress(address string, minVersion string) bool {
 		return false
 	}
 
+	if !info.GetIsSynced() || !info.GetIsUtxoIndexed() {
+		return false
+	}
+
 	// Version check (discards commit tag like -6d0698f35)
 	if minVersion != "" {
 		serverVer := info.GetServerVersion()
