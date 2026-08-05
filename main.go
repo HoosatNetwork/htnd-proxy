@@ -31,13 +31,14 @@ var (
 	listenAddr  = flag.String("listen", ":42420", "listen address")
 	refreshSec  = flag.Int("refresh", 30, "refresh interval")
 	manualPeers = flag.String("manual-peers", "", "additional manual RPC peers (comma-separated)")
+	minVersion  = flag.String("min-version", "2.10.1", "minimum HTND version")
 )
 
 var (
-	healthyPeers   []string
-	peersMu        sync.RWMutex
-	nextPeer       uint64
-	clientPeerMap  sync.Map // maps clientAddr (string) -> assigned peer (string)
+	healthyPeers    []string
+	peersMu         sync.RWMutex
+	nextPeer        uint64
+	clientPeerMap   sync.Map // maps clientAddr (string) -> assigned peer (string)
 	peerConnections sync.Map // maps peer address -> *grpc.ClientConn
 )
 
@@ -50,6 +51,8 @@ const (
 	maxConcurrentStreams    = ^uint32(0)
 	listenAddrEnv           = "listen"
 	listenAddrEnvUpper      = "LISTEN"
+	minVersionEnv           = "min-version"
+	minVresionEnvUpper      = "MIN_VERSION"
 	localRPCPeerHostEnv     = "LOCAL_PEER_HOST"
 	localRPCPeerPortEnv     = "LOCAL_PEER_PORT"
 	manualRPCPeersEnv       = "MANUAL_RPC_PEERS"
@@ -126,7 +129,7 @@ func updateHealthyPeers(good []string) {
 	oldPeers := healthyPeers
 	healthyPeers = good
 	peersMu.Unlock()
-	
+
 	// Close connections for peers that are no longer healthy
 	for _, peer := range oldPeers {
 		isStillHealthy := false
@@ -141,7 +144,7 @@ func updateHealthyPeers(good []string) {
 			log.Printf("Closed connection to unhealthy peer: %s", peer)
 		}
 	}
-	
+
 	log.Printf("Loaded %d RPC peers", len(good))
 }
 
@@ -188,7 +191,7 @@ func getPeerConnection(ctx context.Context, peerAddr string) (*grpc.ClientConn, 
 
 	// Store in cache
 	peerConnections.Store(peerAddr, conn)
-	
+
 	return conn, nil
 }
 
@@ -332,12 +335,13 @@ func filterReachableRPCPeers(candidates []string) []string {
 
 	reachable := make([]bool, len(candidates))
 	var wg sync.WaitGroup
+
 	for i, address := range candidates {
 		log.Printf("Checking candidate %s", address)
 		wg.Add(1)
 		go func(index int, address string) {
 			defer wg.Done()
-			if probeRPCAddress(address) {
+			if probeRPCAddress(address, *minVersion) {
 				reachable[index] = true
 			}
 		}(i, address)
@@ -354,9 +358,56 @@ func filterReachableRPCPeers(candidates []string) []string {
 	return good
 }
 
-func probeRPCAddress(address string) bool {
-	log.Printf("Probing manual/direct RPC peer: %s", address)
+func stripCommitTag(version string) string {
+	if idx := strings.Index(version, "-"); idx != -1 {
+		return version[:idx]
+	}
+	return version
+}
 
+func parseVersion(v string) (major, minor, patch int, err error) {
+	parts := strings.Split(v, ".")
+	if len(parts) < 3 {
+		return 0, 0, 0, fmt.Errorf("invalid version format: %s", v)
+	}
+	major, err = strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	minor, err = strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	patch, err = strconv.Atoi(parts[2])
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return major, minor, patch, nil
+}
+
+// isVersionAtLeast returns true if version (after stripping commit tag) >= minVersion.
+// Both versions are expected in the form "major.minor.patch".
+func isVersionAtLeast(version, minVersion string) bool {
+	clean := stripCommitTag(version)
+	vMaj, vMin, vPat, err := parseVersion(clean)
+	if err != nil {
+		return false
+	}
+	mMaj, mMin, mPat, err := parseVersion(minVersion)
+	if err != nil {
+		return false
+	}
+	if vMaj != mMaj {
+		return vMaj > mMaj
+	}
+	if vMin != mMin {
+		return vMin > mMin
+	}
+	return vPat >= mPat
+}
+
+func probeRPCAddress(address string, minVersion string) bool {
+	log.Printf("Probing manual/direct RPC peer: %s", address)
 	ctx, cancel := context.WithTimeout(context.Background(), peerProbeTimeout)
 	defer cancel()
 
@@ -404,15 +455,24 @@ func probeRPCAddress(address string) bool {
 		return false
 	}
 
+	// Version check (discards commit tag like -6d0698f35)
+	if minVersion != "" {
+		serverVer := info.GetServerVersion()
+		if !isVersionAtLeast(serverVer, minVersion) {
+			log.Printf("Server version %s (clean: %s) is below required %s for %s",
+				serverVer, stripCommitTag(serverVer), minVersion, address)
+			return false
+		}
+	}
+
 	if rpcErr := info.GetError(); rpcErr != nil && rpcErr.GetMessage() != "" {
 		log.Printf("RPC error from %s: %s", address, rpcErr.GetMessage())
 		return false
 	}
 
 	success := info.GetIsSynced() && info.GetIsUtxoIndexed()
-	log.Printf("Probe %s -> synced=%v, utxoIndexed=%v → %v",
-		address, info.GetIsSynced(), info.GetIsUtxoIndexed(), success)
-
+	log.Printf("Probe %s -> synced=%v, utxoIndexed=%v, version=%s → %v",
+		address, info.GetIsSynced(), info.GetIsUtxoIndexed(), info.GetServerVersion(), success)
 	return success
 }
 
@@ -606,6 +666,10 @@ func (p *proxyServer) MessageStream(stream protowire.RPC_MessageStreamServer) er
 func main() {
 	if envListenAddr := firstEnv(listenAddrEnv, listenAddrEnvUpper); envListenAddr != "" {
 		*listenAddr = envListenAddr
+	}
+
+	if envMinVersion := firstEnv(minVersionEnv, minVresionEnvUpper); envMinVersion != "" {
+		*minVersion = envMinVersion
 	}
 
 	flag.Parse()
